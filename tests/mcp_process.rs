@@ -26,6 +26,11 @@ fn process_handles_initialize_and_tool_listing_as_json_rpc() {
         .expect("initialize request");
         writeln!(
             stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .expect("initialized notification");
+        writeln!(
+            stdin,
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
         )
         .expect("tools request");

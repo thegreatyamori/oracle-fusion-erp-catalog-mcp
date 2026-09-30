@@ -1,7 +1,11 @@
 use crate::paths::ensure_parent_directory;
-use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult, Transaction};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    path::Path,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Version {
@@ -41,6 +45,8 @@ pub struct ReferenceRecord {
     pub target_table_id: i64,
     pub target_column: Option<String>,
     pub constraint_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_unique_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,8 +127,31 @@ pub struct CatalogIndex {
     pub is_unique: bool,
 }
 
+#[derive(Default)]
+struct QueryCache {
+    active: Option<Option<Version>>,
+    related: Option<(i64, RelatedGraph)>,
+}
+
+struct RelatedGraph {
+    edges: Vec<RelatedEdge>,
+    adjacency: BTreeMap<i64, Vec<usize>>,
+    tables: HashMap<i64, TableRecord>,
+}
+
+struct RelatedEdge {
+    source_id: i64,
+    source_name: String,
+    source_column: String,
+    target_id: i64,
+    target_name: String,
+    target_column: Option<String>,
+    constraint_name: Option<String>,
+}
+
 pub struct Database {
     connection: Connection,
+    cache: RefCell<QueryCache>,
 }
 
 impl Database {
@@ -133,10 +162,29 @@ impl Database {
                 .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
         }
         let connection = Connection::open(path)?;
-        connection.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let db = Self { connection };
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -65536;",
+        )?;
+        let db = Self::from_connection(connection);
         db.migrate()?;
         Ok(db)
+    }
+
+    fn from_connection(connection: Connection) -> Self {
+        Self {
+            connection,
+            cache: RefCell::new(QueryCache::default()),
+        }
+    }
+
+    fn invalidate(&self) {
+        let mut cache = self.cache.borrow_mut();
+        cache.active = None;
+        cache.related = None;
     }
 
     pub fn in_memory() -> SqlResult<Self> {
@@ -283,6 +331,7 @@ impl Database {
     fn migrate(&self) -> SqlResult<()> {
         let rebuild_fts = self.migrate_legacy_schema()?;
         self.migrate_nullable_target_column()?;
+        let create_column_search = !self.table_exists("columns_fts")?;
         self.connection.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS versions (
@@ -337,13 +386,27 @@ impl Database {
                 version_id UNINDEXED,
                 tokenize = 'unicode61 remove_diacritics 2'
             );
+            CREATE VIRTUAL TABLE IF NOT EXISTS columns_fts USING fts5(
+                column_name,
+                description,
+                column_id UNINDEXED,
+                table_id UNINDEXED,
+                version_id UNINDEXED,
+                tokenize = 'unicode61 remove_diacritics 2'
+            );
             CREATE INDEX IF NOT EXISTS idx_tables_version_module
                 ON tables(version_id, module);
             CREATE INDEX IF NOT EXISTS idx_columns_table
                 ON columns(table_id);
+            CREATE INDEX IF NOT EXISTS idx_columns_name
+                ON columns(column_name);
+            CREATE INDEX IF NOT EXISTS idx_fk_source
+                ON foreign_key_references(source_table_id);
+            CREATE INDEX IF NOT EXISTS idx_fk_target
+                ON foreign_key_references(target_table_id);
             "#,
         )?;
-        if rebuild_fts {
+        if rebuild_fts || create_column_search {
             let version_ids: Vec<i64> = self
                 .connection
                 .prepare("SELECT id FROM versions")?
@@ -357,6 +420,7 @@ impl Database {
     }
 
     pub fn create_version(&self, release_code: &str, active: bool) -> SqlResult<i64> {
+        self.invalidate();
         if active {
             self.connection
                 .execute("UPDATE versions SET active_bool = 0", [])?;
@@ -369,6 +433,15 @@ impl Database {
     }
 
     pub fn active_version(&self) -> SqlResult<Option<Version>> {
+        if let Some(cached) = self.cache.borrow().active.clone() {
+            return Ok(cached);
+        }
+        let version = self.query_active_version()?;
+        self.cache.borrow_mut().active = Some(version.clone());
+        Ok(version)
+    }
+
+    fn query_active_version(&self) -> SqlResult<Option<Version>> {
         self.connection
             .query_row(
                 "SELECT id, release_code, synced_at, active_bool
@@ -449,13 +522,34 @@ impl Database {
     }
 
     pub fn delete_version_by_release(&self, release_code: &str) -> SqlResult<bool> {
-        Ok(self.connection.execute(
-            "DELETE FROM versions WHERE release_code = ?1",
-            params![release_code],
-        )? > 0)
+        self.invalidate();
+        let version_id: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT id FROM versions WHERE release_code = ?1",
+                params![release_code],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(version_id) = version_id else {
+            return Ok(false);
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "DELETE FROM tables_fts WHERE version_id = ?1",
+            params![version_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM columns_fts WHERE version_id = ?1",
+            params![version_id],
+        )?;
+        transaction.execute("DELETE FROM versions WHERE id = ?1", params![version_id])?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn activate_version(&self, version_id: i64) -> SqlResult<()> {
+        self.invalidate();
         self.connection.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             self.connection
@@ -476,6 +570,7 @@ impl Database {
     }
 
     pub fn clone_version(&self, source_id: i64, release_code: &str) -> SqlResult<i64> {
+        self.invalidate();
         let tx = self.connection.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO versions (release_code, active_bool)
@@ -627,6 +722,7 @@ impl Database {
     }
 
     pub fn upsert_catalog_table(&self, version_id: i64, table: &CatalogTable) -> SqlResult<i64> {
+        self.invalidate();
         let tx = self.connection.unchecked_transaction()?;
         let table_id = Self::upsert_catalog_table_tx(&tx, version_id, table)?;
         tx.commit()?;
@@ -634,12 +730,132 @@ impl Database {
         Ok(table_id)
     }
 
-    pub fn upsert_catalog_tables(&self, version_id: i64, tables: &[CatalogTable]) -> SqlResult<()> {
-        let tx = self.connection.unchecked_transaction()?;
-        for table in tables {
-            Self::upsert_catalog_table_tx(&tx, version_id, table)?;
+    pub fn import_catalog<F>(
+        &self,
+        version_id: i64,
+        tables: &[CatalogTable],
+        mut on_progress: F,
+    ) -> SqlResult<()>
+    where
+        F: FnMut(usize, usize),
+    {
+        self.invalidate();
+        let total = tables.len();
+        let transaction = self.connection.unchecked_transaction()?;
+        delete_stale_module_tables(&transaction, version_id, tables)?;
+
+        let mut table_ids: HashMap<String, i64> = HashMap::new();
+        {
+            let mut existing =
+                transaction.prepare("SELECT table_name, id FROM tables WHERE version_id = ?1")?;
+            let rows = existing.query_map(params![version_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (name, id) = row?;
+                table_ids.insert(name, id);
+            }
         }
-        tx.commit()?;
+
+        {
+            let mut upsert_table = transaction.prepare(
+                "INSERT INTO tables
+                    (version_id, module, table_name, description, source_url, object_type)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(version_id, table_name) DO UPDATE SET
+                   module = excluded.module,
+                   description = excluded.description,
+                   source_url = excluded.source_url,
+                   object_type = excluded.object_type
+                 RETURNING id",
+            )?;
+            for table in tables {
+                let table_name = table.table_name.to_ascii_uppercase();
+                let table_id: i64 = upsert_table.query_row(
+                    params![
+                        version_id,
+                        table.module,
+                        table_name,
+                        table.description,
+                        table.source_url,
+                        table.object_type
+                    ],
+                    |row| row.get(0),
+                )?;
+                table_ids.insert(table_name, table_id);
+            }
+        }
+
+        let mut delete_columns = transaction.prepare("DELETE FROM columns WHERE table_id = ?1")?;
+        let mut delete_references =
+            transaction.prepare("DELETE FROM foreign_key_references WHERE source_table_id = ?1")?;
+        let mut delete_indexes = transaction.prepare("DELETE FROM indexes WHERE table_id = ?1")?;
+        let mut insert_column = transaction.prepare(
+            "INSERT INTO columns
+                (table_id, column_name, data_type, length, nullable, description)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        let mut insert_reference = transaction.prepare(
+            "INSERT OR IGNORE INTO foreign_key_references
+                (source_table_id, source_column, target_table_id, target_column, constraint_name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        let mut insert_index = transaction.prepare(
+            "INSERT INTO indexes (table_id, index_name, indexed_columns, is_unique)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+
+        for (index, table) in tables.iter().enumerate() {
+            let table_name = table.table_name.to_ascii_uppercase();
+            let Some(table_id) = table_ids.get(&table_name).copied() else {
+                return Err(rusqlite::Error::QueryReturnedNoRows);
+            };
+            delete_columns.execute(params![table_id])?;
+            delete_references.execute(params![table_id])?;
+            delete_indexes.execute(params![table_id])?;
+            for column in &table.columns {
+                insert_column.execute(params![
+                    table_id,
+                    column.column_name.to_ascii_uppercase(),
+                    column.data_type,
+                    column.length,
+                    column.nullable,
+                    column.description
+                ])?;
+            }
+            for reference in &table.references {
+                let target_name = reference.target_table.to_ascii_uppercase();
+                let Some(target_id) = table_ids.get(&target_name).copied() else {
+                    continue;
+                };
+                insert_reference.execute(params![
+                    table_id,
+                    reference.source_column.to_ascii_uppercase(),
+                    target_id,
+                    reference
+                        .target_column
+                        .as_deref()
+                        .map(str::to_ascii_uppercase),
+                    reference.constraint_name
+                ])?;
+            }
+            for index_record in &table.indexes {
+                insert_index.execute(params![
+                    table_id,
+                    index_record.index_name.to_ascii_uppercase(),
+                    index_record.indexed_columns.join(","),
+                    index_record.is_unique
+                ])?;
+            }
+            on_progress(index + 1, total);
+        }
+        drop(delete_columns);
+        drop(delete_references);
+        drop(delete_indexes);
+        drop(insert_column);
+        drop(insert_reference);
+        drop(insert_index);
+        transaction.commit()?;
         Ok(())
     }
 
@@ -659,20 +875,38 @@ impl Database {
              WHERE t.version_id = ?1 GROUP BY t.id",
             params![version_id],
         )?;
+        self.connection.execute(
+            "DELETE FROM columns_fts WHERE version_id = ?1",
+            params![version_id],
+        )?;
+        self.connection.execute(
+            "INSERT INTO columns_fts
+             (column_name, description, column_id, table_id, version_id)
+             SELECT c.column_name, COALESCE(c.description, ''), c.id, c.table_id, t.version_id
+             FROM columns c JOIN tables t ON t.id = c.table_id
+             WHERE t.version_id = ?1",
+            params![version_id],
+        )?;
         Ok(())
     }
 
-    pub fn list_modules_and_tables(&self, module: Option<&str>) -> SqlResult<Vec<TableRecord>> {
+    pub fn list_modules_and_tables(
+        &self,
+        module: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> SqlResult<Vec<TableRecord>> {
         let version = self
             .active_version()?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT id, version_id, module, table_name, description, source_url, object_type
              FROM tables WHERE version_id = ?1
              AND (?2 IS NULL OR lower(module) = lower(?2))
-             ORDER BY module, table_name",
+             ORDER BY module, table_name
+             LIMIT ?3 OFFSET ?4",
         )?;
-        let rows = statement.query_map(params![version.id, module], |row| {
+        let rows = statement.query_map(params![version.id, module, limit, offset], |row| {
             Ok(TableRecord {
                 id: row.get(0)?,
                 version_id: row.get(1)?,
@@ -691,18 +925,18 @@ impl Database {
             .active_version()?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
         let exact = query.trim().to_ascii_uppercase();
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT t.id, t.version_id, t.module, t.table_name, t.description,
-                    t.source_url, t.object_type
+                    t.source_url, t.object_type, 0 AS rank
              FROM tables t WHERE t.version_id = ?1 AND t.table_name = ?2
              UNION ALL
              SELECT t.id, t.version_id, t.module, t.table_name, t.description,
-                    t.source_url, t.object_type
+                    t.source_url, t.object_type, 1 AS rank
              FROM tables_fts f JOIN tables t ON t.id = f.table_id
              WHERE f.version_id = ?1 AND tables_fts MATCH ?3 AND t.table_name <> ?2
-             ORDER BY table_name LIMIT ?4",
+             ORDER BY rank, table_name LIMIT ?4",
         )?;
-        let fts_query = format!("\"{}\"*", query.replace('"', " "));
+        let fts_query = fts_prefix_query(query);
         let rows = statement.query_map(params![version.id, exact, fts_query, limit], |row| {
             Ok(TableRecord {
                 id: row.get(0)?,
@@ -726,23 +960,34 @@ impl Database {
         let version = self
             .active_version()?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
-        let pattern = format!("%{}%", query.trim().to_ascii_lowercase());
-        let mut statement = self.connection.prepare(
+        let exact = query.trim().to_ascii_uppercase();
+        let mut statement = self.connection.prepare_cached(
             "SELECT t.id, t.version_id, t.module, t.table_name, t.description,
                     t.source_url, t.object_type,
                     c.id, c.table_id, c.column_name, c.data_type, c.length,
-                    c.nullable, c.description
+                    c.nullable, c.description, 0 AS rank
              FROM columns c
              JOIN tables t ON t.id = c.table_id
              WHERE t.version_id = ?1
                AND (?2 IS NULL OR lower(t.module) = lower(?2))
-               AND (lower(c.column_name) LIKE ?3 OR lower(COALESCE(c.description, '')) LIKE ?3)
-             ORDER BY CASE WHEN lower(c.column_name) = lower(?4) THEN 0 ELSE 1 END,
-                      t.table_name, c.column_name
+               AND c.column_name = ?3
+             UNION ALL
+             SELECT t.id, t.version_id, t.module, t.table_name, t.description,
+                    t.source_url, t.object_type,
+                    c.id, c.table_id, c.column_name, c.data_type, c.length,
+                    c.nullable, c.description, 1 AS rank
+             FROM columns_fts f
+             JOIN columns c ON c.id = f.column_id
+             JOIN tables t ON t.id = c.table_id
+             WHERE f.version_id = ?1
+               AND (?2 IS NULL OR lower(t.module) = lower(?2))
+               AND columns_fts MATCH ?4
+               AND c.column_name <> ?3
+             ORDER BY rank, table_name, column_name
              LIMIT ?5",
         )?;
         let rows = statement.query_map(
-            params![version.id, module, pattern, query.trim(), limit],
+            params![version.id, module, exact, fts_prefix_query(query), limit],
             |row| {
                 Ok(ColumnSearchResult {
                     table: TableRecord {
@@ -779,21 +1024,24 @@ impl Database {
             .active_version()?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
         let exact = column.trim().to_ascii_uppercase();
-        let prefix = format!("{exact}%");
-        let mut statement = self.connection.prepare(
+        let Some(upper) = prefix_upper_bound(&exact) else {
+            return Ok(Vec::new());
+        };
+        let mut statement = self.connection.prepare_cached(
             "SELECT DISTINCT t.id, t.version_id, t.module, t.table_name,
                     t.description, t.source_url, t.object_type
-             FROM tables t
-             JOIN columns c ON c.table_id = t.id
+             FROM columns c
+             JOIN tables t ON t.id = c.table_id
              WHERE t.version_id = ?1
                AND (?2 IS NULL OR lower(t.module) = lower(?2))
-               AND (c.column_name = ?3 OR c.column_name LIKE ?4)
+               AND c.column_name >= ?3
+               AND c.column_name < ?4
              ORDER BY CASE WHEN c.column_name = ?3 THEN 0 ELSE 1 END,
                       t.table_name
              LIMIT ?5",
         )?;
         let rows =
-            statement.query_map(params![version.id, module, exact, prefix, limit], |row| {
+            statement.query_map(params![version.id, module, exact, upper, limit], |row| {
                 Ok(TableRecord {
                     id: row.get(0)?,
                     version_id: row.get(1)?,
@@ -899,6 +1147,7 @@ impl Database {
                     target_table_id: row.get(3)?,
                     target_column: row.get(4)?,
                     constraint_name: row.get(5)?,
+                    target_unique_columns: Vec::new(),
                 })
             })?
             .collect();
@@ -909,7 +1158,7 @@ impl Database {
         let version = self
             .active_version()?
             .ok_or_else(|| rusqlite::Error::QueryReturnedNoRows)?;
-        let mut statement = self.connection.prepare(
+        let mut statement = self.connection.prepare_cached(
             "SELECT r.id, r.source_table_id, r.source_column, r.target_table_id,
                     r.target_column, r.constraint_name
              FROM foreign_key_references r
@@ -920,7 +1169,7 @@ impl Database {
                  OR (source.table_name = upper(?3) AND target.table_name = upper(?2)))
              ORDER BY r.id",
         )?;
-        let rows = statement
+        let mut rows = statement
             .query_map(params![version.id, left, right], |row| {
                 Ok(ReferenceRecord {
                     id: row.get(0)?,
@@ -929,10 +1178,40 @@ impl Database {
                     target_table_id: row.get(3)?,
                     target_column: row.get(4)?,
                     constraint_name: row.get(5)?,
+                    target_unique_columns: Vec::new(),
                 })
             })?
-            .collect();
-        rows
+            .collect::<SqlResult<Vec<_>>>()?;
+        let mut unique_columns = HashMap::new();
+        for row in &mut rows {
+            if let Some(columns) = unique_columns.get(&row.target_table_id) {
+                row.target_unique_columns.clone_from(columns);
+                continue;
+            }
+            let columns = self.unique_index_columns(row.target_table_id)?;
+            row.target_unique_columns.clone_from(&columns);
+            unique_columns.insert(row.target_table_id, columns);
+        }
+        Ok(rows)
+    }
+
+    fn unique_index_columns(&self, table_id: i64) -> SqlResult<Vec<String>> {
+        let mut statement = self.connection.prepare_cached(
+            "SELECT indexed_columns FROM indexes
+             WHERE table_id = ?1 AND is_unique = 1
+             ORDER BY index_name",
+        )?;
+        let columns = statement.query_map(params![table_id], |row| row.get::<_, String>(0))?;
+        let mut names = Vec::new();
+        for column in columns {
+            for name in column?.split(',') {
+                let name = name.trim();
+                if !name.is_empty() && !names.iter().any(|existing| existing == name) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        Ok(names)
     }
 
     pub fn find_related_tables(
@@ -955,30 +1234,16 @@ impl Database {
         let Some(root) = root else {
             return Ok(Vec::new());
         };
-
-        let mut statement = self.connection.prepare(
-            "SELECT r.source_table_id, source.table_name, r.source_column,
-                    r.target_table_id, target.table_name, r.target_column,
-                    r.constraint_name
-             FROM foreign_key_references r
-             JOIN tables source ON source.id = r.source_table_id
-             JOIN tables target ON target.id = r.target_table_id
-             WHERE source.version_id = ?1
-             ORDER BY r.id",
-        )?;
-        let references = statement
-            .query_map(params![version.id], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                ))
-            })?
-            .collect::<SqlResult<Vec<_>>>()?;
+        self.ensure_related_graph(version.id)?;
+        let cache = self.cache.borrow();
+        let Some(graph) = cache
+            .related
+            .as_ref()
+            .filter(|(cached_id, _)| *cached_id == version.id)
+            .map(|(_, graph)| graph)
+        else {
+            return Ok(Vec::new());
+        };
 
         let mut frontier = BTreeSet::from([root]);
         let mut visited = BTreeSet::from([root]);
@@ -987,48 +1252,37 @@ impl Database {
             if frontier.is_empty() || results.len() >= limit {
                 break;
             }
+            let mut touching = Vec::new();
+            for node in &frontier {
+                if let Some(indexes) = graph.adjacency.get(node) {
+                    touching.extend(indexes.iter().copied());
+                }
+            }
+            touching.sort_unstable();
+            touching.dedup();
             let mut next = BTreeSet::new();
-            for (
-                source_id,
-                source_name,
-                source_column,
-                target_id,
-                target_name,
-                target_column,
-                constraint_name,
-            ) in &references
-            {
-                let related_id = if frontier.contains(source_id) {
-                    Some(*target_id)
-                } else if frontier.contains(target_id) {
-                    Some(*source_id)
+            for edge_index in touching {
+                let edge = &graph.edges[edge_index];
+                let related_id = if frontier.contains(&edge.source_id) {
+                    edge.target_id
                 } else {
-                    None
+                    edge.source_id
                 };
-                let Some(related_id) = related_id else {
-                    continue;
-                };
-                if visited.contains(&related_id) {
+                if !visited.insert(related_id) {
                     continue;
                 }
-                let related_table = if related_id == *source_id {
-                    self.table_by_id(*source_id)?
-                } else {
-                    self.table_by_id(*target_id)?
-                };
-                let Some(table) = related_table else {
+                let Some(table) = graph.tables.get(&related_id).cloned() else {
                     continue;
                 };
                 results.push(RelatedTable {
                     table,
-                    source_table: source_name.clone(),
-                    source_column: source_column.clone(),
-                    target_table: target_name.clone(),
-                    target_column: target_column.clone(),
-                    constraint_name: constraint_name.clone(),
+                    source_table: edge.source_name.clone(),
+                    source_column: edge.source_column.clone(),
+                    target_table: edge.target_name.clone(),
+                    target_column: edge.target_column.clone(),
+                    constraint_name: edge.constraint_name.clone(),
                     depth,
                 });
-                visited.insert(related_id);
                 next.insert(related_id);
                 if results.len() >= limit {
                     break;
@@ -1039,26 +1293,145 @@ impl Database {
         Ok(results)
     }
 
-    fn table_by_id(&self, table_id: i64) -> SqlResult<Option<TableRecord>> {
-        self.connection
-            .query_row(
-                "SELECT id, version_id, module, table_name, description, source_url, object_type
-                 FROM tables WHERE id = ?1",
-                params![table_id],
-                |row| {
-                    Ok(TableRecord {
-                        id: row.get(0)?,
-                        version_id: row.get(1)?,
-                        module: row.get(2)?,
-                        table_name: row.get(3)?,
-                        description: row.get(4)?,
-                        source_url: row.get(5)?,
-                        object_type: row.get(6)?,
-                    })
-                },
-            )
-            .optional()
+    fn ensure_related_graph(&self, version_id: i64) -> SqlResult<()> {
+        if self
+            .cache
+            .borrow()
+            .related
+            .as_ref()
+            .is_some_and(|(cached_id, _)| *cached_id == version_id)
+        {
+            return Ok(());
+        }
+        let graph = self.load_related_graph(version_id)?;
+        self.cache.borrow_mut().related = Some((version_id, graph));
+        Ok(())
     }
+
+    fn load_related_graph(&self, version_id: i64) -> SqlResult<RelatedGraph> {
+        let mut tables = HashMap::new();
+        let mut table_statement = self.connection.prepare_cached(
+            "SELECT id, version_id, module, table_name, description, source_url, object_type
+             FROM tables WHERE version_id = ?1",
+        )?;
+        for row in table_statement.query_map(params![version_id], read_table)? {
+            let table = row?;
+            tables.insert(table.id, table);
+        }
+        drop(table_statement);
+
+        let mut edge_statement = self.connection.prepare_cached(
+            "SELECT r.source_table_id, source.table_name, r.source_column,
+                    r.target_table_id, target.table_name, r.target_column,
+                    r.constraint_name
+             FROM foreign_key_references r
+             JOIN tables source ON source.id = r.source_table_id
+             JOIN tables target ON target.id = r.target_table_id
+             WHERE source.version_id = ?1
+             ORDER BY r.id",
+        )?;
+        let mut edges = Vec::new();
+        let mut adjacency: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+        let rows = edge_statement.query_map(params![version_id], |row| {
+            Ok(RelatedEdge {
+                source_id: row.get(0)?,
+                source_name: row.get(1)?,
+                source_column: row.get(2)?,
+                target_id: row.get(3)?,
+                target_name: row.get(4)?,
+                target_column: row.get(5)?,
+                constraint_name: row.get(6)?,
+            })
+        })?;
+        for row in rows {
+            let edge = row?;
+            let index = edges.len();
+            adjacency.entry(edge.source_id).or_default().push(index);
+            adjacency.entry(edge.target_id).or_default().push(index);
+            edges.push(edge);
+        }
+        Ok(RelatedGraph {
+            edges,
+            adjacency,
+            tables,
+        })
+    }
+}
+
+fn read_table(row: &rusqlite::Row<'_>) -> SqlResult<TableRecord> {
+    Ok(TableRecord {
+        id: row.get(0)?,
+        version_id: row.get(1)?,
+        module: row.get(2)?,
+        table_name: row.get(3)?,
+        description: row.get(4)?,
+        source_url: row.get(5)?,
+        object_type: row.get(6)?,
+    })
+}
+
+fn delete_stale_module_tables(
+    transaction: &Transaction<'_>,
+    version_id: i64,
+    tables: &[CatalogTable],
+) -> SqlResult<()> {
+    transaction.execute("DROP TABLE IF EXISTS sync_keep", [])?;
+    transaction.execute(
+        "CREATE TEMP TABLE sync_keep (
+            module TEXT NOT NULL,
+            table_name TEXT NOT NULL,
+            PRIMARY KEY (module, table_name)
+        )",
+        [],
+    )?;
+    {
+        let mut insert = transaction
+            .prepare("INSERT OR IGNORE INTO sync_keep (module, table_name) VALUES (?1, ?2)")?;
+        let mut seen = HashSet::new();
+        for table in tables {
+            let module = table.module.as_str();
+            let table_name = table.table_name.to_ascii_uppercase();
+            if seen.insert((module.to_owned(), table_name.clone())) {
+                insert.execute(params![module, table_name])?;
+            }
+        }
+    }
+    transaction.execute(
+        "DELETE FROM tables
+         WHERE version_id = ?1
+           AND module IN (SELECT module FROM sync_keep)
+           AND NOT EXISTS (
+               SELECT 1 FROM sync_keep
+               WHERE sync_keep.module = tables.module
+                 AND sync_keep.table_name = tables.table_name
+           )
+           AND NOT EXISTS (
+               SELECT 1
+               FROM foreign_key_references referenced
+               JOIN tables source ON source.id = referenced.source_table_id
+               WHERE referenced.target_table_id = tables.id
+                 AND source.module NOT IN (SELECT module FROM sync_keep)
+           )",
+        params![version_id],
+    )?;
+    transaction.execute("DROP TABLE sync_keep", [])?;
+    Ok(())
+}
+
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.last_mut() {
+        if *last < u8::MAX {
+            *last += 1;
+            return String::from_utf8(bytes).ok();
+        }
+        bytes.pop();
+    }
+    None
+}
+
+fn fts_prefix_query(query: &str) -> String {
+    format!("\"{}\"*", query.replace('"', " "))
 }
 
 #[cfg(test)]
@@ -1187,7 +1560,7 @@ mod tests {
                 ",
             )
             .expect("legacy schema");
-        let db = Database { connection };
+        let db = Database::from_connection(connection);
         db.migrate().expect("schema migration");
         assert!(db.table_exists("versions").expect("versions table"));
         assert!(db
@@ -1197,5 +1570,67 @@ mod tests {
         assert!(db
             .table_exists("foreign_key_references")
             .expect("references table"));
+    }
+
+    #[test]
+    fn ranks_exact_table_name_ahead_of_description_matches() {
+        let db = Database::in_memory().expect("in-memory SQLite");
+        let version_id = db.create_version("26B", true).expect("release");
+        let mut other = sample_table("AAA_FIRST");
+        other.description = Some("AP_INVOICES_ALL appears in the description".to_owned());
+        db.upsert_catalog_table(version_id, &other)
+            .expect("other table");
+        db.upsert_catalog_table(version_id, &sample_table("AP_INVOICES_ALL"))
+            .expect("exact table");
+
+        let matches = db.search_tables("AP_INVOICES_ALL", 10).expect("search");
+        assert_eq!(matches[0].table_name, "AP_INVOICES_ALL");
+    }
+
+    #[test]
+    fn column_prefix_uses_the_name_range() {
+        let db = Database::in_memory().expect("in-memory SQLite");
+        let version_id = db.create_version("26B", true).expect("release");
+        let mut table = sample_table("PO_LINES_ALL");
+        table.columns.push(CatalogColumn {
+            column_name: "HEADER_ID".to_owned(),
+            data_type: "NUMBER".to_owned(),
+            length: None,
+            nullable: false,
+            description: Some("Header".to_owned()),
+        });
+        table.columns.push(CatalogColumn {
+            column_name: "VENDOR_ID".to_owned(),
+            data_type: "NUMBER".to_owned(),
+            length: None,
+            nullable: true,
+            description: None,
+        });
+        db.upsert_catalog_table(version_id, &table).expect("table");
+
+        let matches = db
+            .find_tables_by_column("HEADER", None, 10)
+            .expect("prefix lookup");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].table_name, "PO_LINES_ALL");
+    }
+
+    #[test]
+    fn deleting_a_release_removes_its_search_rows() {
+        let db = Database::in_memory().expect("in-memory SQLite");
+        let version_id = db.create_version("26B", true).expect("release");
+        db.upsert_catalog_table(version_id, &sample_table("PO_HEADERS_ALL"))
+            .expect("table");
+        assert!(db.delete_version_by_release("26B").expect("delete"));
+        let tables_fts: i64 = db
+            .connection
+            .query_row("SELECT COUNT(*) FROM tables_fts", [], |row| row.get(0))
+            .expect("tables fts");
+        let columns_fts: i64 = db
+            .connection
+            .query_row("SELECT COUNT(*) FROM columns_fts", [], |row| row.get(0))
+            .expect("columns fts");
+        assert_eq!(tables_fts, 0);
+        assert_eq!(columns_fts, 0);
     }
 }

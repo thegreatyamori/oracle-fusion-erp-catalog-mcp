@@ -50,7 +50,9 @@ fn queries_are_limited_to_the_active_release() {
     db.upsert_catalog_table(active_id, &table("CURRENT_TABLE", "Current release"))
         .expect("current table");
 
-    let tables = db.list_modules_and_tables(None).expect("list query");
+    let tables = db
+        .list_modules_and_tables(None, 100, 0)
+        .expect("list query");
     assert_eq!(tables.len(), 1);
     assert_eq!(tables[0].table_name, "CURRENT_TABLE");
     assert!(db

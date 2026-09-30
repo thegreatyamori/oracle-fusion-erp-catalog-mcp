@@ -224,36 +224,47 @@ fn update_opencode_config(path: &Path, options: &InstallOptions) -> Result<Write
 
 fn update_toml_config(path: &Path, options: &InstallOptions) -> Result<WriteStatus> {
     let original = read_text(path)?;
-    let mut document = original
-        .parse::<toml::Value>()
-        .with_context(|| format!("could not parse {}", path.display()))?;
-    let table = document
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("{} must contain a TOML table", path.display()))?;
-    let servers = table
-        .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow!("mcp_servers in {} must be a table", path.display()))?;
-    let mut server = toml::map::Map::new();
-    server.insert(
-        "command".to_owned(),
-        toml::Value::String(options.binary.to_string_lossy().into_owned()),
-    );
-    server.insert("args".to_owned(), toml::Value::Array(Vec::new()));
-    let mut env_table = toml::map::Map::new();
-    env_table.insert(
-        "ORACLE_MCP_DATABASE".to_owned(),
-        toml::Value::String(options.database.to_string_lossy().into_owned()),
-    );
-    server.insert("env".to_owned(), toml::Value::Table(env_table));
-    let desired = toml::Value::Table(server);
-    let changed = servers.get(SERVER_NAME) != Some(&desired);
+    let mut document = if original.trim().is_empty() {
+        toml_edit::DocumentMut::new()
+    } else {
+        original
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("could not parse {}", path.display()))?
+    };
+    let command = options.binary.to_string_lossy().into_owned();
+    let database = options.database.to_string_lossy().into_owned();
+    let current_command = document
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(|server| server.get("command"))
+        .and_then(toml_edit::Item::as_str);
+    let current_database = document
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(SERVER_NAME))
+        .and_then(|server| server.get("env"))
+        .and_then(|env| env.get("ORACLE_MCP_DATABASE"))
+        .and_then(toml_edit::Item::as_str);
+    let changed =
+        current_command != Some(command.as_str()) || current_database != Some(database.as_str());
     if changed {
-        servers.insert(SERVER_NAME.to_owned(), desired);
+        let servers = require_table(&mut document, "mcp_servers", "mcp_servers")?;
+        let server = require_table(servers, SERVER_NAME, "mcp server")?;
+        server.insert("command", toml_edit::value(command));
+        server.insert("args", toml_edit::value(toml_edit::Array::new()));
+        let env = require_table(server, "env", "env")?;
+        env.insert("ORACLE_MCP_DATABASE", toml_edit::value(database));
     }
-    let content = toml::to_string_pretty(&document)?;
-    write_text(path, &content, options.dry_run, changed)
+    write_text(path, &document.to_string(), options.dry_run, changed)
+}
+
+fn require_table<'a>(
+    parent: &'a mut toml_edit::Table,
+    key: &str,
+    label: &str,
+) -> Result<&'a mut toml_edit::Table> {
+    let item = parent.entry(key).or_insert(toml_edit::table());
+    item.as_table_mut()
+        .ok_or_else(|| anyhow!("{label} must be a table"))
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -378,7 +389,7 @@ mod tests {
     fn supports_codex_toml_config() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        fs::write(&path, "[other]\nkeep = true\n").expect("config");
+        fs::write(&path, "# keep me\n[other]\nkeep = true\n").expect("config");
         let options = options(dir.path(), false);
         update_toml_config(&path, &options).expect("write");
         let value: toml::Value = fs::read_to_string(path)
@@ -390,6 +401,18 @@ mod tests {
             Some(options.database.to_string_lossy().as_ref())
         );
         assert_eq!(value["other"]["keep"].as_bool(), Some(true));
+        let text = fs::read_to_string(dir.path().join("config.toml")).expect("read");
+        assert!(text.contains("# keep me"));
+    }
+
+    #[test]
+    fn rejects_a_codex_server_table_that_is_not_a_table() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "mcp_servers = \"nope\"\n").expect("config");
+        let error =
+            update_toml_config(&path, &options(dir.path(), false)).expect_err("non-table config");
+        assert!(error.to_string().contains("must be a table"));
     }
 
     #[test]

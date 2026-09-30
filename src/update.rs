@@ -2,10 +2,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     env, fs,
     io::Write,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -239,13 +240,16 @@ fn write_and_replace(temporary: &Path, current: &Path, binary: &[u8]) -> Result<
         .context("could not write update temporary file")?;
     file.sync_all()
         .context("could not flush update temporary file")?;
-    let mut permissions = file
-        .metadata()
-        .context("could not inspect update temporary file")?
-        .permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(temporary, permissions)
-        .context("could not make updated binary executable")?;
+    #[cfg(unix)]
+    {
+        let mut permissions = file
+            .metadata()
+            .context("could not inspect update temporary file")?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(temporary, permissions)
+            .context("could not make updated binary executable")?;
+    }
     fs::rename(temporary, current).context("could not replace current binary")?;
     Ok(())
 }

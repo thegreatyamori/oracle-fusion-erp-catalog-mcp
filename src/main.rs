@@ -79,13 +79,20 @@ async fn main() -> io::Result<()> {
             .await
             .map_err(|error| io::Error::other(error.to_string())),
         Some("install") => run_install_command(&args[1..]),
-        _ => run_mcp().await,
+        None => run_mcp().await,
+        Some(command) => {
+            eprintln!("unsupported command: {command}");
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported command: {command}"),
+            ))
+        }
     }
 }
 
 fn cli_help() -> &'static str {
     "Oracle Fusion ERP Catalog MCP\n\n\
-Usage:\n  oracle-fusion-erp-catalog-mcp [OPTIONS]\n  oracle-fusion-erp-catalog-mcp install AGENT [OPTIONS]\n  oracle-fusion-erp-catalog-mcp update [OPTIONS]\n  oracle-fusion-erp-catalog-mcp sync --release RELEASE [OPTIONS]\n\n\
+Usage:\n  oracle-fusion-erp-catalog-mcp [OPTIONS]\n  oracle-fusion-erp-catalog-mcp install AGENT [OPTIONS]\n  oracle-fusion-erp-catalog-mcp update [OPTIONS]\n  oracle-fusion-erp-catalog-mcp catalog install --release RELEASE\n  oracle-fusion-erp-catalog-mcp sync --release RELEASE [OPTIONS]\n\n\
 Options:\n  -h, --help       Show this help\n  -V, --version    Show the version\n\n\
 With no command, the process starts the MCP server."
 }
@@ -346,7 +353,9 @@ fn parse_sync_args(args: &[String]) -> anyhow::Result<(String, Vec<OracleModule>
 }
 
 async fn run_mcp() -> io::Result<()> {
-    update::notify_if_available().await;
+    tokio::spawn(async {
+        update::notify_if_available().await;
+    });
     let database_path =
         paths::database_path().map_err(|error| io::Error::other(error.to_string()))?;
     let database = match Database::open(&database_path) {
@@ -366,12 +375,15 @@ async fn run_mcp() -> io::Result<()> {
         }
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(request) => handle_request(&database, request),
-            Err(error) => error_response(
+            Err(error) => Some(error_response(
                 None,
                 -32700,
                 "invalid JSON",
                 Some(json!({ "detail": error.to_string() })),
-            ),
+            )),
+        };
+        let Some(response) = response else {
+            continue;
         };
         let encoded = serde_json::to_string(&response).unwrap_or_else(|_| {
             r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal error"}}"#
@@ -384,11 +396,17 @@ async fn run_mcp() -> io::Result<()> {
     Ok(())
 }
 
-fn handle_request(database: &Database, request: JsonRpcRequest) -> JsonRpcResponse {
+fn handle_request(database: &Database, request: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    request.id.as_ref()?;
     if request.jsonrpc != "2.0" {
-        return error_response(request.id, -32600, "jsonrpc must be 2.0", None);
+        return Some(error_response(
+            request.id,
+            -32600,
+            "jsonrpc must be 2.0",
+            None,
+        ));
     }
-    match request.method.as_str() {
+    Some(match request.method.as_str() {
         "initialize" => success(
             request.id,
             json!({
@@ -397,15 +415,13 @@ fn handle_request(database: &Database, request: JsonRpcRequest) -> JsonRpcRespon
                 "serverInfo": { "name": "oracle-fusion-erp-catalog-mcp", "version": env!("CARGO_PKG_VERSION") }
             }),
         ),
-        "notifications/initialized" => success(request.id, json!({})),
         "tools/list" => success(request.id, tool_definitions()),
         "tools/call" => match call_tool(database, &request.params) {
             Ok(result) => success(request.id, result),
             Err(error) => error_response(request.id, -32602, &error, None),
         },
-        _ if request.id.is_none() => success(None, json!({})),
         _ => error_response(request.id, -32601, "method not supported", None),
-    }
+    })
 }
 
 fn tool_definitions() -> Value {
@@ -413,10 +429,14 @@ fn tool_definitions() -> Value {
         "tools": [
             {
                 "name": "list_modules_and_tables",
-                "description": "Lists tables from the active release, optionally filtered by module.",
+                "description": "Lists tables from the active release. Filter by module and page with limit and offset.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": { "module": { "type": "string" } }
+                    "properties": {
+                        "module": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                        "offset": { "type": "integer", "minimum": 0 }
+                    }
                 }
             },
             {
@@ -506,8 +526,18 @@ fn call_tool(database: &Database, params: &Value) -> Result<Value, String> {
     match name {
         "list_modules_and_tables" => {
             let module = arguments.get("module").and_then(Value::as_str);
+            let limit = arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .unwrap_or(100)
+                .clamp(1, 500) as usize;
+            let offset = arguments
+                .get("offset")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(1_000_000) as usize;
             let tables = database
-                .list_modules_and_tables(module)
+                .list_modules_and_tables(module, limit, offset)
                 .map_err(|error| error.to_string())?;
             Ok(tool_result(
                 serde_json::to_value(tables).map_err(|e| e.to_string())?,
@@ -618,7 +648,7 @@ fn tool_result(value: Value) -> Value {
         json!({ "data": value })
     };
     json!({
-        "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
+        "content": [{ "type": "text", "text": serde_json::to_string(&value).unwrap_or_default() }],
         "structuredContent": structured_content,
         "isError": false
     })

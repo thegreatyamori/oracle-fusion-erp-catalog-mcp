@@ -100,7 +100,7 @@ Available tools:
 
 | Tool | Description |
 | --- | --- |
-| `list_modules_and_tables` | Lists tables from the active release, optionally filtered by module. |
+| `list_modules_and_tables` | Lists tables from the active release. Optional module filter, limit, and offset. |
 | `search_table_structure` | Searches for a table and returns its technical structure. |
 | `suggest_joins` | Returns direct relationships between two tables. |
 | `find_tables_by_column` | Finds tables containing a column. |
