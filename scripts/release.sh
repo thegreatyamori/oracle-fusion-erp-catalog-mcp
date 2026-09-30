@@ -86,7 +86,8 @@ remote_branch=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/nu
     echo "error: main must track origin/main" >&2
     exit 1
 }
-git fetch origin main --tags
+# Binary releases use only semver tags; catalog-* tags are managed separately.
+git fetch origin main 'refs/tags/v*:refs/tags/v*'
 git diff --quiet HEAD origin/main || {
     echo "error: local main is not synchronized with origin/main" >&2
     exit 1
