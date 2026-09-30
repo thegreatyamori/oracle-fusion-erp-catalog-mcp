@@ -69,9 +69,18 @@ PY
 
 printf '%s  %s\n' "$checksum" "$asset" > "$temporary_directory/SHA256SUMS"
 tag="catalog-${release}"
-gh release create "$tag" \
-    "$temporary_directory/$asset" \
-    "$temporary_directory/manifest.json" \
-    "$temporary_directory/SHA256SUMS" \
-    --title "Oracle catalog $release" \
-    --notes "Pre-generated Oracle Fusion ERP catalog for release $release."
+if gh release view "$tag" >/dev/null 2>&1; then
+    gh release upload "$tag" \
+        "$temporary_directory/$asset" \
+        "$temporary_directory/manifest.json" \
+        "$temporary_directory/SHA256SUMS" \
+        --clobber
+else
+    gh release create "$tag" \
+        "$temporary_directory/$asset" \
+        "$temporary_directory/manifest.json" \
+        "$temporary_directory/SHA256SUMS" \
+        --target "$(git rev-parse HEAD)" \
+        --title "Oracle catalog $release" \
+        --notes "Pre-generated Oracle Fusion ERP catalog for release $release."
+fi
